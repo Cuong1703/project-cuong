@@ -3,10 +3,12 @@ import {
   Plus, X, Calendar, User, Trash2, Pencil, Search,
   FileText, ShoppingCart, Settings, Truck, Wrench,
   ChevronLeft, ChevronRight, GripVertical, AlertTriangle,
-  LayoutGrid, Loader2, CheckCircle2, LogOut
+  LayoutGrid, Loader2, CheckCircle2, LogOut, ShieldCheck
 } from "lucide-react";
 import { supabase } from "./lib/supabaseClient";
 import AuthScreen from "./AuthScreen";
+import AccessStatusScreen from "./AccessStatusScreen";
+import AdminPanel from "./AdminPanel";
 
 const STAGES = [
   { id: 0, title: "Báo giá", icon: FileText, color: "#1D4ED8", bg: "#EEF3FF" },
@@ -253,6 +255,8 @@ function ConfirmDelete({ onConfirm, onCancel }) {
 
 export default function ProjectManagerApp() {
   const [session, setSession] = useState(undefined); // undefined = chưa xác định, null = chưa đăng nhập
+  const [profile, setProfile] = useState(undefined); // undefined = đang tải, null = chưa có
+  const [view, setView] = useState("board"); // board | admin
   const [projects, setProjects] = useState([]);
   const [loading, setLoading] = useState(true);
   const [saveState, setSaveState] = useState("idle"); // idle | saving | saved | error
@@ -268,9 +272,24 @@ export default function ProjectManagerApp() {
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
     const { data: listener } = supabase.auth.onAuthStateChange((_event, newSession) => {
       setSession(newSession);
+      setProfile(undefined);
+      setView("board");
     });
     return () => listener.subscription.unsubscribe();
   }, []);
+
+  // Tải hồ sơ (vai trò + trạng thái duyệt) của người đang đăng nhập
+  useEffect(() => {
+    if (!session) return;
+    (async () => {
+      const { data, error } = await supabase
+        .from("profiles")
+        .select("*")
+        .eq("id", session.user.id)
+        .maybeSingle();
+      setProfile(!error && data ? data : null);
+    })();
+  }, [session]);
 
   // Chuyển đổi giữa dữ liệu app (camelCase) và dòng dữ liệu trong Supabase (snake_case)
   const fromRow = (row) => ({
@@ -284,21 +303,22 @@ export default function ProjectManagerApp() {
     createdAt: row.created_at,
   });
 
-  // Tải danh sách dự án của người dùng đang đăng nhập
+  // Tải danh sách dự án của người dùng đang đăng nhập (chỉ khi đã được duyệt)
   useEffect(() => {
-    if (!session) return;
+    if (!session || profile?.status !== "approved") return;
     setLoading(true);
     (async () => {
       const { data, error } = await supabase
         .from("projects")
         .select("*")
+        .eq("user_id", session.user.id)
         .order("created_at", { ascending: true });
       if (!error && data) {
         setProjects(data.map(fromRow));
       }
       setLoading(false);
     })();
-  }, [session]);
+  }, [session, profile]);
 
   const handleSignOut = async () => {
     await supabase.auth.signOut();
@@ -393,7 +413,12 @@ export default function ProjectManagerApp() {
   const totalValue = projects.reduce((sum, p) => sum + (Number(p.value) || 0), 0);
   const overdueCount = projects.filter((p) => p.deadline && daysUntil(p.deadline) < 0).length;
 
-  if (session === undefined || (session && loading)) {
+  const isPendingLoad =
+    session === undefined ||
+    (session && profile === undefined) ||
+    (session && profile?.status === "approved" && loading);
+
+  if (isPendingLoad) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-slate-50">
         <Loader2 className="animate-spin text-blue-500" size={28} />
@@ -403,6 +428,10 @@ export default function ProjectManagerApp() {
 
   if (!session) {
     return <AuthScreen />;
+  }
+
+  if (!profile || profile.status !== "approved") {
+    return <AccessStatusScreen status={profile?.status || "pending"} email={session.user.email} />;
   }
 
   return (
@@ -435,15 +464,29 @@ export default function ProjectManagerApp() {
             </div>
           </div>
 
-          <button
-            onClick={() => { setEditingProject(null); setModalOpen(true); }}
-            className="flex items-center gap-1.5 rounded-lg px-4 py-2 text-sm font-semibold text-white shadow-sm flex-shrink-0"
-            style={{ backgroundColor: "#1D4ED8" }}
-          >
-            <Plus size={16} /> Dự án mới
-          </button>
+          {view === "board" && (
+            <button
+              onClick={() => { setEditingProject(null); setModalOpen(true); }}
+              className="flex items-center gap-1.5 rounded-lg px-4 py-2 text-sm font-semibold text-white shadow-sm flex-shrink-0"
+              style={{ backgroundColor: "#1D4ED8" }}
+            >
+              <Plus size={16} /> Dự án mới
+            </button>
+          )}
 
           <div className="flex items-center gap-2 flex-shrink-0">
+            {profile.role === "admin" && (
+              <button
+                onClick={() => setView(view === "board" ? "admin" : "board")}
+                className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium ${
+                  view === "admin"
+                    ? "bg-blue-50 text-blue-700"
+                    : "text-slate-500 hover:bg-slate-100"
+                }`}
+              >
+                <ShieldCheck size={15} /> {view === "admin" ? "Dự án của tôi" : "Quản trị"}
+              </button>
+            )}
             <span className="text-xs text-slate-400 max-w-[140px] truncate hidden sm:inline">
               {session.user.email}
             </span>
@@ -458,6 +501,7 @@ export default function ProjectManagerApp() {
         </div>
 
         {/* Stats bar */}
+        {view === "board" && (
         <div className="max-w-7xl mx-auto px-5 pb-3 flex items-center gap-5 flex-wrap text-xs">
           <div className="flex items-center gap-1.5 text-slate-500">
             <LayoutGrid size={13} />
@@ -477,8 +521,13 @@ export default function ProjectManagerApp() {
             {saveState === "error" && <span className="text-red-500">Lỗi lưu dữ liệu</span>}
           </div>
         </div>
+        )}
       </header>
 
+      {view === "admin" ? (
+        <AdminPanel currentUserId={session.user.id} />
+      ) : (
+      <>
       {/* Board */}
       <main className="max-w-7xl mx-auto px-5 py-6">
         <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
@@ -546,6 +595,8 @@ export default function ProjectManagerApp() {
           </div>
         )}
       </main>
+      </>
+      )}
 
       {modalOpen && (
         <ProjectFormModal
