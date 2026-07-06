@@ -1,10 +1,12 @@
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import {
   Plus, X, Calendar, User, Trash2, Pencil, Search,
   FileText, ShoppingCart, Settings, Truck, Wrench,
   ChevronLeft, ChevronRight, GripVertical, AlertTriangle,
-  LayoutGrid, Loader2, CheckCircle2
+  LayoutGrid, Loader2, CheckCircle2, LogOut
 } from "lucide-react";
+import { supabase } from "./lib/supabaseClient";
+import AuthScreen from "./AuthScreen";
 
 const STAGES = [
   { id: 0, title: "Báo giá", icon: FileText, color: "#1D4ED8", bg: "#EEF3FF" },
@@ -13,8 +15,6 @@ const STAGES = [
   { id: 3, title: "Giao hàng", icon: Truck, color: "#0E9BA6", bg: "#E9FAFB" },
   { id: 4, title: "Thi công lắp đặt", icon: Wrench, color: "#0F9D58", bg: "#EAFBF1" },
 ];
-
-const STORAGE_KEY = "manager-projects-v1";
 
 function uid() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
@@ -252,6 +252,7 @@ function ConfirmDelete({ onConfirm, onCancel }) {
 }
 
 export default function ProjectManagerApp() {
+  const [session, setSession] = useState(undefined); // undefined = chưa xác định, null = chưa đăng nhập
   const [projects, setProjects] = useState([]);
   const [loading, setLoading] = useState(true);
   const [saveState, setSaveState] = useState("idle"); // idle | saving | saved | error
@@ -261,71 +262,123 @@ export default function ProjectManagerApp() {
   const [draggedId, setDraggedId] = useState(null);
   const [dragOverStage, setDragOverStage] = useState(null);
   const [search, setSearch] = useState("");
-  const saveTimer = useRef(null);
 
-  // Load on mount (dùng localStorage của trình duyệt thay cho window.storage)
+  // Theo dõi trạng thái đăng nhập (Supabase Auth)
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        setProjects(JSON.parse(raw));
-      }
-    } catch (e) {
-      // key chưa tồn tại — bắt đầu rỗng
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  const persist = useCallback((next) => {
-    setSaveState("saving");
-    clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(() => {
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-        setSaveState("saved");
-      } catch (e) {
-        setSaveState("error");
-      }
-    }, 350);
-  }, []);
-
-  const updateProjects = (updater) => {
-    setProjects((prev) => {
-      const next = typeof updater === "function" ? updater(prev) : updater;
-      persist(next);
-      return next;
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, newSession) => {
+      setSession(newSession);
     });
+    return () => listener.subscription.unsubscribe();
+  }, []);
+
+  // Chuyển đổi giữa dữ liệu app (camelCase) và dòng dữ liệu trong Supabase (snake_case)
+  const fromRow = (row) => ({
+    id: row.id,
+    name: row.name,
+    customer: row.customer || "",
+    value: row.value ?? "",
+    deadline: row.deadline || "",
+    notes: row.notes || "",
+    stage: row.stage,
+    createdAt: row.created_at,
+  });
+
+  // Tải danh sách dự án của người dùng đang đăng nhập
+  useEffect(() => {
+    if (!session) return;
+    setLoading(true);
+    (async () => {
+      const { data, error } = await supabase
+        .from("projects")
+        .select("*")
+        .order("created_at", { ascending: true });
+      if (!error && data) {
+        setProjects(data.map(fromRow));
+      }
+      setLoading(false);
+    })();
+  }, [session]);
+
+  const handleSignOut = async () => {
+    await supabase.auth.signOut();
+    setProjects([]);
   };
 
-  const handleSave = (data) => {
+  const handleSave = async (data) => {
+    setSaveState("saving");
     if (editingProject) {
-      updateProjects((prev) => prev.map((p) => (p.id === editingProject.id ? { ...p, ...data } : p)));
+      const { error } = await supabase
+        .from("projects")
+        .update({
+          name: data.name,
+          customer: data.customer,
+          value: data.value === "" ? null : data.value,
+          deadline: data.deadline || null,
+          notes: data.notes,
+          stage: data.stage,
+        })
+        .eq("id", editingProject.id);
+      if (!error) {
+        setProjects((prev) => prev.map((p) => (p.id === editingProject.id ? { ...p, ...data } : p)));
+        setSaveState("saved");
+      } else {
+        setSaveState("error");
+      }
     } else {
-      updateProjects((prev) => [...prev, { ...data, id: uid(), createdAt: Date.now() }]);
+      const { data: inserted, error } = await supabase
+        .from("projects")
+        .insert({
+          user_id: session.user.id,
+          name: data.name,
+          customer: data.customer,
+          value: data.value === "" ? null : data.value,
+          deadline: data.deadline || null,
+          notes: data.notes,
+          stage: data.stage,
+        })
+        .select()
+        .single();
+      if (!error && inserted) {
+        setProjects((prev) => [...prev, fromRow(inserted)]);
+        setSaveState("saved");
+      } else {
+        setSaveState("error");
+      }
     }
     setModalOpen(false);
     setEditingProject(null);
   };
 
-  const handleDelete = (id) => {
-    updateProjects((prev) => prev.filter((p) => p.id !== id));
+  const handleDelete = async (id) => {
+    setSaveState("saving");
+    const { error } = await supabase.from("projects").delete().eq("id", id);
+    if (!error) {
+      setProjects((prev) => prev.filter((p) => p.id !== id));
+      setSaveState("saved");
+    } else {
+      setSaveState("error");
+    }
     setDeletingId(null);
   };
 
+  const updateStage = async (id, nextStage) => {
+    setSaveState("saving");
+    setProjects((prev) => prev.map((p) => (p.id === id ? { ...p, stage: nextStage } : p)));
+    const { error } = await supabase.from("projects").update({ stage: nextStage }).eq("id", id);
+    setSaveState(error ? "error" : "saved");
+  };
+
   const handleMove = (id, delta) => {
-    updateProjects((prev) =>
-      prev.map((p) => {
-        if (p.id !== id) return p;
-        const next = Math.min(STAGES.length - 1, Math.max(0, p.stage + delta));
-        return { ...p, stage: next };
-      })
-    );
+    const proj = projects.find((p) => p.id === id);
+    if (!proj) return;
+    const next = Math.min(STAGES.length - 1, Math.max(0, proj.stage + delta));
+    updateStage(id, next);
   };
 
   const handleDrop = (stageId) => {
     if (draggedId != null) {
-      updateProjects((prev) => prev.map((p) => (p.id === draggedId ? { ...p, stage: stageId } : p)));
+      updateStage(draggedId, stageId);
     }
     setDraggedId(null);
     setDragOverStage(null);
@@ -340,12 +393,16 @@ export default function ProjectManagerApp() {
   const totalValue = projects.reduce((sum, p) => sum + (Number(p.value) || 0), 0);
   const overdueCount = projects.filter((p) => p.deadline && daysUntil(p.deadline) < 0).length;
 
-  if (loading) {
+  if (session === undefined || (session && loading)) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-slate-50">
         <Loader2 className="animate-spin text-blue-500" size={28} />
       </div>
     );
+  }
+
+  if (!session) {
+    return <AuthScreen />;
   }
 
   return (
@@ -385,6 +442,19 @@ export default function ProjectManagerApp() {
           >
             <Plus size={16} /> Dự án mới
           </button>
+
+          <div className="flex items-center gap-2 flex-shrink-0">
+            <span className="text-xs text-slate-400 max-w-[140px] truncate hidden sm:inline">
+              {session.user.email}
+            </span>
+            <button
+              onClick={handleSignOut}
+              title="Đăng xuất"
+              className="p-2 rounded-lg text-slate-400 hover:text-red-500 hover:bg-red-50"
+            >
+              <LogOut size={16} />
+            </button>
+          </div>
         </div>
 
         {/* Stats bar */}
